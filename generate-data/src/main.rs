@@ -66,6 +66,7 @@ fn main() -> Result<()> {
     build_node_versions()?;
     build_node_release_schedule()?;
     build_caniuse()?;
+    build_baseline()?;
 
     Ok(())
 }
@@ -600,4 +601,272 @@ impl<'s> StrPool<'s> {
 
         &self.pool[(offset as usize)..][..(len as usize)]
     }
+}
+
+fn build_baseline() -> Result<()> {
+    let csv_content = run_node(r#"
+const { getAllVersions } = require('baseline-browser-mapping');
+process.stdout.write(getAllVersions({ outputFormat: 'csv', useSupports: true }).toString());
+"#)?;
+
+    // Map CSV browser names to caniuse browser names
+    let browser_map: HashMap<&str, &str> = [
+        ("chrome", "chrome"),
+        ("chrome_android", "and_chr"),
+        ("edge", "edge"),
+        ("firefox", "firefox"),
+        ("firefox_android", "and_ff"),
+        ("safari", "safari"),
+        ("safari_ios", "ios_saf"),
+    ]
+    .into_iter()
+    .collect();
+
+    // Per year -> (caniuse_browser -> first_version), first insertion wins
+    let mut year_mins: BTreeMap<u16, BTreeMap<&'static str, String>> = BTreeMap::new();
+    // First version per browser with supports="widely"
+    let mut widely_mins: BTreeMap<&'static str, String> = BTreeMap::new();
+    // First version per browser with supports="newly"
+    let mut newly_mins: BTreeMap<&'static str, String> = BTreeMap::new();
+
+    for line in csv_content.lines().skip(1) {
+        let fields: Vec<&str> = line.split(',').map(|f| f.trim_matches('"')).collect();
+        if fields.len() < 4 {
+            continue;
+        }
+        let csv_browser = fields[0];
+        let version = fields[1];
+        let year_str = fields[2];
+        let supports = fields[3];
+
+        let Some(&caniuse_browser) = browser_map.get(csv_browser) else {
+            continue;
+        };
+
+        if year_str != "pre_baseline" {
+            if let Ok(year_num) = year_str.parse::<u16>() {
+                year_mins
+                    .entry(year_num)
+                    .or_default()
+                    .entry(caniuse_browser)
+                    .or_insert_with(|| version.to_owned());
+            }
+        }
+
+        if supports == "widely" {
+            widely_mins
+                .entry(caniuse_browser)
+                .or_insert_with(|| version.to_owned());
+        }
+
+        if supports == "newly" {
+            newly_mins
+                .entry(caniuse_browser)
+                .or_insert_with(|| version.to_owned());
+        }
+    }
+
+    // baseline-widely.rs: &[(&str, &str)] sorted by browser name
+    let widely_entries: Vec<_> = widely_mins
+        .iter()
+        .map(|(browser, version)| quote! { (#browser, #version) })
+        .collect();
+    fs::write(
+        format!("{OUT_DIR}/baseline-widely.rs"),
+        quote! { &[#(#widely_entries),*] }.to_string(),
+    )?;
+
+    // baseline-newly.rs: &[(&str, &str)] sorted by browser name
+    let newly_entries: Vec<_> = newly_mins
+        .iter()
+        .map(|(browser, version)| quote! { (#browser, #version) })
+        .collect();
+    fs::write(
+        format!("{OUT_DIR}/baseline-newly.rs"),
+        quote! { &[#(#newly_entries),*] }.to_string(),
+    )?;
+
+    // baseline-years.rs: &[(u16, &str, &str)] sorted by (year, browser)
+    let year_entries: Vec<_> = year_mins
+        .iter()
+        .flat_map(|(year, browsers)| {
+            let year = *year;
+            browsers
+                .iter()
+                .map(move |(browser, version)| quote! { (#year, #browser, #version) })
+        })
+        .collect();
+    fs::write(
+        format!("{OUT_DIR}/baseline-years.rs"),
+        quote! { &[#(#year_entries),*] }.to_string(),
+    )?;
+
+    // baseline-features.rs: cumulative change points sorted by cutoff date
+    // Each entry: (date, chrome, chrome_android, edge, firefox, firefox_android, safari, safari_ios)
+    build_baseline_features()?;
+
+    // baseline-downstream.rs: downstream browser engine-version -> browser-version mappings
+    build_baseline_downstream()?;
+
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct FeatureChangePoint {
+    date: String,
+    c: String,
+    ca: String,
+    e: String,
+    f: String,
+    fa: String,
+    s: String,
+    si: String,
+}
+
+fn build_baseline_features() -> Result<()> {
+    let json = run_node(
+        r#"
+const { getTimeline } = require('baseline-browser-mapping');
+const timeline = getTimeline();
+const bcdToShort = {
+    chrome: 'c', chrome_android: 'ca', edge: 'e',
+    firefox: 'f', firefox_android: 'fa', safari: 's', safari_ios: 'si'
+};
+const browsers = ['c','ca','e','f','fa','s','si'];
+const cmp = (a, b) => {
+    const [am=0,an=0]=a.split('.',2).map(Number);
+    const [bm=0,bn=0]=b.split('.',2).map(Number);
+    if(am!==bm)return am>bm?1:-1;
+    if(an!==bn)return an>bn?1:-1;
+    return 0;
+};
+const allDates = new Set();
+for (const browser in timeline) {
+    for (const entry of timeline[browser]) {
+        allDates.add(entry.date);
+    }
+}
+const sortedDates = Array.from(allDates).sort();
+const pts = [];
+const current = {c:'0', ca:'0', e:'0', f:'0', fa:'0', s:'0', si:'0'};
+const browserEvents = Object.fromEntries(
+    Object.entries(timeline).map(([browser, events]) => [
+        bcdToShort[browser], 
+        events.sort((a, b) => a.date.localeCompare(b.date))
+    ])
+);
+for (const date of sortedDates) {
+    let changed = false;
+    for (const shortName of browsers) {
+        let latestVersion = '0';
+        for (const ev of browserEvents[shortName]) {
+            if (ev.date <= date) latestVersion = ev.version;
+            else break;
+        }
+        if (cmp(latestVersion, current[shortName]) > 0) {
+            current[shortName] = latestVersion;
+            changed = true;
+        }
+    }
+    if (changed) {
+        pts.push({ date, ...current });
+    }
+}
+process.stdout.write(JSON.stringify(pts));
+"#,
+    )?;
+
+    let points: Vec<FeatureChangePoint> = serde_json::from_str(&json)?;
+
+    let entries: Vec<_> = points
+        .iter()
+        .map(|p| {
+            let (date, c, ca, e, f, fa, s, si) =
+                (&p.date, &p.c, &p.ca, &p.e, &p.f, &p.fa, &p.s, &p.si);
+            quote! { (#date, #c, #ca, #e, #f, #fa, #s, #si) }
+        })
+        .collect();
+
+    fs::write(
+        format!("{OUT_DIR}/baseline-features.rs"),
+        quote! {
+            // (cutoff_date, chrome, chrome_android, edge, firefox, firefox_android, safari, safari_ios)
+            // Sorted by date; each entry is the cumulative max min-versions as of that date.
+            &[#(#entries),*]
+        }
+        .to_string(),
+    )?;
+
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct DownstreamEntry {
+    caniuse: String,
+    engine: String,
+    engine_version: u16,
+    browser_version: String,
+}
+
+fn build_baseline_downstream() -> Result<()> {
+    let json = run_node(
+        r#"
+const { getAllVersions } = require('baseline-browser-mapping');
+const bbmToCaniuse = {
+    webview_android:'android', samsunginternet_android:'samsung',
+    opera_android:'op_mob', opera:'opera',
+    qq_android:'and_qq', uc_android:'and_uc', kai_os:'kaios'
+};
+const result=[];
+const allVersions = getAllVersions({ includeDownstreamBrowsers: true, includeKaiOS: true });
+allVersions.forEach(v => {
+    if (v.engine) {
+        const cname = bbmToCaniuse[v.browser];
+        if (cname) {
+            result.push({
+                caniuse: cname,
+                engine: v.engine.toLowerCase(),
+                engine_version: parseInt(v.engine_version),
+                browser_version: v.version
+            });
+        }
+    }
+});
+process.stdout.write(JSON.stringify(result));
+"#,
+    )?;
+
+    let entries: Vec<DownstreamEntry> = serde_json::from_str(&json)?;
+
+    let blink: Vec<_> = entries
+        .iter()
+        .filter(|e| e.engine == "blink")
+        .map(|e| {
+            let (caniuse, ev, bv) = (&e.caniuse, e.engine_version, &e.browser_version);
+            quote! { (#caniuse, #ev, #bv) }
+        })
+        .collect();
+
+    let gecko: Vec<_> = entries
+        .iter()
+        .filter(|e| e.engine == "gecko")
+        .map(|e| {
+            let (caniuse, ev, bv) = (&e.caniuse, e.engine_version, &e.browser_version);
+            quote! { (#caniuse, #ev, #bv) }
+        })
+        .collect();
+
+    fs::write(
+        format!("{OUT_DIR}/baseline-downstream.rs"),
+        quote! {
+            // (caniuse_browser, engine_major_version, browser_version)
+            // For Blink-based downstream browsers (sorted by browser_version within each browser).
+            static BASELINE_DOWNSTREAM_BLINK: &[(&str, u16, &str)] = &[#(#blink),*];
+            // For Gecko-based downstream browsers.
+            static BASELINE_DOWNSTREAM_GECKO: &[(&str, u16, &str)] = &[#(#gecko),*];
+        }
+        .to_string(),
+    )?;
+
+    Ok(())
 }
